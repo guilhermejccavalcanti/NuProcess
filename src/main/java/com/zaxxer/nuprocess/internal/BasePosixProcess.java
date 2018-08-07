@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.zaxxer.nuprocess.internal;
 
 import java.nio.ByteBuffer;
@@ -26,7 +25,6 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-
 import com.sun.jna.Memory;
 import com.sun.jna.Native;
 import com.sun.jna.Pointer;
@@ -35,640 +33,575 @@ import com.sun.jna.ptr.IntByReference;
 import com.zaxxer.nuprocess.NuProcess;
 import com.zaxxer.nuprocess.NuProcessHandler;
 
-public abstract class BasePosixProcess implements NuProcess
-{
-   protected static final boolean IS_MAC = System.getProperty("os.name").toLowerCase().contains("mac");
-   protected static final boolean IS_LINUX = System.getProperty("os.name").toLowerCase().contains("linux");
-   private static final boolean LINUX_USE_VFORK = Boolean.parseBoolean(System.getProperty("com.zaxxer.nuprocess.linuxUseVfork", "true"));
-   private static final boolean IS_SOFTEXIT_DETECTION;
+public abstract class BasePosixProcess implements NuProcess {
 
-   protected static IEventProcessor<? extends BasePosixProcess>[] processors;
-   protected static int processorRoundRobin;
+    protected static final boolean IS_MAC = System.getProperty("os.name").toLowerCase().contains("mac");
 
-   protected IEventProcessor<? super BasePosixProcess> myProcessor;
-   protected volatile NuProcessHandler processHandler;
+    protected static final boolean IS_LINUX = System.getProperty("os.name").toLowerCase().contains("linux");
 
-   protected volatile int pid;
-   protected AtomicInteger exitCode;
-   protected CountDownLatch exitPending;
+    private static final boolean LINUX_USE_VFORK = Boolean.parseBoolean(System.getProperty("com.zaxxer.nuprocess.linuxUseVfork", "true"));
 
-   protected AtomicBoolean userWantsWrite;
+    private static final boolean IS_SOFTEXIT_DETECTION;
 
-   // ******* Input/Output Buffers
-   protected ByteBuffer outBuffer;
-   protected ByteBuffer inBuffer;
-   protected Pointer outBufferPointer;
-   protected Pointer inBufferPointer;
+    protected static IEventProcessor<? extends BasePosixProcess>[] processors;
 
-   // ******* Stdin/Stdout/Stderr pipe handles
-   protected AtomicInteger stdin;
-   protected AtomicInteger stdout;
-   protected AtomicInteger stderr;
-   protected volatile int stdinWidow;
-   protected volatile int stdoutWidow;
-   protected volatile int stderrWidow;
+    protected static int processorRoundRobin;
 
-   protected boolean outClosed;
-   protected boolean errClosed;
+    protected IEventProcessor<? super BasePosixProcess> myProcessor;
 
-   private ConcurrentLinkedQueue<ByteBuffer> pendingWrites;
-   private int remainingWrite;
-   private int writeOffset;
+    protected volatile NuProcessHandler processHandler;
 
-   private Pointer posix_spawn_file_actions;
+    protected volatile int pid;
 
-   static {
-      IS_SOFTEXIT_DETECTION = Boolean.valueOf(System.getProperty("com.zaxxer.nuprocess.softExitDetection", "true"));
+    protected AtomicInteger exitCode;
 
-      int numThreads = 1;
-      String threads = System.getProperty("com.zaxxer.nuprocess.threads", "auto");
-      if ("auto".equals(threads)) {
-         numThreads = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
-      }
-      else if ("cores".equals(threads)) {
-         numThreads = Runtime.getRuntime().availableProcessors();
-      }
-      else {
-         numThreads = Math.max(1, Integer.parseInt(threads));
-      }
+    protected CountDownLatch exitPending;
 
-      processors = new IEventProcessor<?>[numThreads];
+    protected AtomicBoolean userWantsWrite;
 
-      if (Boolean.valueOf(System.getProperty("com.zaxxer.nuprocess.enableShutdownHook", "true"))) {
-         Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
-            @Override
-            public void run()
-            {
-               for (int i = 0; i < processors.length; i++) {
-                  if (processors[i] != null) {
-                     processors[i].shutdown();
-                  }
-               }
-            }
-         }));
-      }
-   }
+    // ******* Input/Output Buffers
+    protected ByteBuffer outBuffer;
 
-   protected BasePosixProcess(NuProcessHandler processListener) {
-      this.processHandler = processListener;
-      this.userWantsWrite = new AtomicBoolean();
-      this.exitCode = new AtomicInteger();
-      this.exitPending = new CountDownLatch(1);
-      this.stdin = new AtomicInteger(-1);
-      this.stdout = new AtomicInteger(-1);
-      this.stderr = new AtomicInteger(-1);
-      this.outClosed = true;
-      this.errClosed = true;
-   }
+    protected ByteBuffer inBuffer;
 
-   // ************************************************************************
-   //                        NuProcess interface methods
-   // ************************************************************************
+    protected Pointer outBufferPointer;
 
-   /** {@inheritDoc} */
-   @Override
-   public boolean isRunning()
-   {
-      return exitPending.getCount() != 0;
-   }
+    protected Pointer inBufferPointer;
 
-   /** {@inheritDoc} */
-   @Override
-   public int waitFor(long timeout, TimeUnit unit) throws InterruptedException
-   {
-      if (timeout == 0) {
-         exitPending.await();
-      }
-      else if (!exitPending.await(timeout, unit)) {
-         return Integer.MIN_VALUE;
-      }
+    // ******* Stdin/Stdout/Stderr pipe handles
+    protected AtomicInteger stdin;
 
-      return exitCode.get();
-   }
+    protected AtomicInteger stdout;
 
-   /** {@inheritDoc} */
-   @Override
-   public void destroy()
-   {
-      if (exitPending.getCount() != 0) {
-         LibC.kill(pid, LibC.SIGTERM);
-         IntByReference exit = new IntByReference();
-         LibC.waitpid(pid, exit, 0);
-         exitCode.set(exit.getValue());
-      }
-   }
+    protected AtomicInteger stderr;
 
-   /** {@inheritDoc} */
-   @Override
-   public void wantWrite()
-   {
-      int fd = stdin.get();
-      if (fd != -1) {
-         userWantsWrite.set(true);
-         myProcessor.queueWrite(this);
-      }
-      else {
-         throw new IllegalStateException("closeStdin() method has already been called.");
-      }
-   }
+    protected volatile int stdinWidow;
 
-   /** {@inheritDoc} */
-   @Override
-   public void closeStdin()
-   {
-      int fd = stdin.getAndSet(-1);
-      if (fd != -1) {
-         if (myProcessor != null) {
-            myProcessor.closeStdin(this);
-         }
-         LibC.close(fd);
-      }
-   }
+    protected volatile int stdoutWidow;
 
-   /** {@inheritDoc} */
-   @Override
-   public void writeStdin(ByteBuffer buffer)
-   {
-      int fd = stdin.get();
-      if (fd != -1) {
-         pendingWrites.add(buffer);
-         myProcessor.queueWrite(this);
-      }
-      else {
-         throw new IllegalStateException("closeStdin() method has already been called.");
-      }
-   }
+    protected volatile int stderrWidow;
 
-   /** {@inheritDoc} */
-   @Override
-   public boolean hasPendingWrites()
-   {
-      return !pendingWrites.isEmpty();
-   }
+    protected boolean outClosed;
 
-   /** {@inheritDoc} */
-   @Override
-   public void setProcessHandler(NuProcessHandler processHandler)
-   {
-      this.processHandler = processHandler;
-   }
+    protected boolean errClosed;
 
-   // ************************************************************************
-   //                             Public methods
-   // ************************************************************************
+    private ConcurrentLinkedQueue<ByteBuffer> pendingWrites;
 
-   public NuProcess start(List<String> command, String[] environment)
-   {
-      String[] commands = command.toArray(new String[0]);
+    private int remainingWrite;
 
-      Pointer posix_spawn_file_actions = createPipes();
+    private int writeOffset;
 
-      Pointer posix_spawnattr = null;
-      if (IS_LINUX) {
-         long peer = Native.malloc(340);
-         posix_spawnattr = new Pointer(peer);
-      }
-      else {
-         posix_spawnattr = new Memory(Pointer.SIZE);
-      }
+    private Pointer posix_spawn_file_actions;
 
-      try {
-         int rc = LibC.posix_spawnattr_init(posix_spawnattr);
-         checkReturnCode(rc, "Internal call to posix_spawnattr_init() failed");
+    static {
+        IS_SOFTEXIT_DETECTION = Boolean.valueOf(System.getProperty("com.zaxxer.nuprocess.softExitDetection", "true"));
+        int numThreads = 1;
+        String threads = System.getProperty("com.zaxxer.nuprocess.threads", "auto");
+        if ("auto".equals(threads)) {
+            numThreads = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+        } else if ("cores".equals(threads)) {
+            numThreads = Runtime.getRuntime().availableProcessors();
+        } else {
+            numThreads = Math.max(1, Integer.parseInt(threads));
+        }
+        processors = new IEventProcessor<?>[numThreads];
+        if (Boolean.valueOf(System.getProperty("com.zaxxer.nuprocess.enableShutdownHook", "true"))) {
+            Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
 
-         short flags = 0;
-         if (IS_LINUX && LINUX_USE_VFORK) {
-            flags = 0x40; // POSIX_SPAWN_USEVFORK
-         }
-         else if (IS_MAC) {
-            // Start the spawned process in suspended mode
-            flags = LibC.POSIX_SPAWN_START_SUSPENDED | LibC.POSIX_SPAWN_CLOEXEC_DEFAULT;
-         }
-         LibC.posix_spawnattr_setflags(posix_spawnattr, flags);
+                @Override
+                public void run() {
+                    for (int i = 0; i < processors.length; i++) {
+                        if (processors[i] != null) {
+                            processors[i].shutdown();
+                        }
+                    }
+                }
+            }));
+        }
+    }
 
-         IntByReference restrict_pid = new IntByReference();
-         rc = LibC.posix_spawnp(restrict_pid, commands[0], posix_spawn_file_actions, posix_spawnattr, new StringArray(commands), new StringArray(environment));
+    static {
+        IS_SOFTEXIT_DETECTION = Boolean.valueOf(System.getProperty("com.zaxxer.nuprocess.softExitDetection", "true"));
+        int numThreads = 1;
+        String threads = System.getProperty("com.zaxxer.nuprocess.threads", "auto");
+        if ("auto".equals(threads)) {
+            numThreads = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+        } else if ("cores".equals(threads)) {
+            numThreads = Runtime.getRuntime().availableProcessors();
+        } else {
+            numThreads = Math.max(1, Integer.parseInt(threads));
+        }
+        processors = new IEventProcessor<?>[numThreads];
+        if (Boolean.valueOf(System.getProperty("com.zaxxer.nuprocess.enableShutdownHook", "true"))) {
+            Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
 
-         pid = restrict_pid.getValue();
+                @Override
+                public void run() {
+                    for (int i = 0; i < processors.length; i++) {
+                        if (processors[i] != null) {
+                            processors[i].shutdown();
+                        }
+                    }
+                }
+            }));
+        }
+    }
 
-         // This is necessary on Linux because spawn failures are not reflected in the rc, and this will reap
-         // any zombies due to launch failure
-         if (IS_LINUX) {
+    protected BasePosixProcess(NuProcessHandler processListener) {
+        this.processHandler = processListener;
+        this.userWantsWrite = new AtomicBoolean();
+        this.exitCode = new AtomicInteger();
+        this.exitPending = new CountDownLatch(1);
+        this.stdin = new AtomicInteger(-1);
+        this.stdout = new AtomicInteger(-1);
+        this.stderr = new AtomicInteger(-1);
+        this.outClosed = true;
+        this.errClosed = true;
+    }
+
+    // ************************************************************************
+    //                        NuProcess interface methods
+    // ************************************************************************
+    /** {@inheritDoc} */
+    @Override
+    public boolean isRunning() {
+        return exitPending.getCount() != 0;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public int waitFor(long timeout, TimeUnit unit) throws InterruptedException {
+        if (timeout == 0) {
+            exitPending.await();
+        } else if (!exitPending.await(timeout, unit)) {
+            return Integer.MIN_VALUE;
+        }
+        return exitCode.get();
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void destroy() {
+        if (exitPending.getCount() != 0) {
+            LibC.kill(pid, LibC.SIGTERM);
             IntByReference exit = new IntByReference();
-            LibC.waitpid(pid, exit, LibC.WNOHANG);
-            rc = (exit.getValue() & 0xff00) >> 8;
-            if (rc == 127) {
-               onExit(Integer.MIN_VALUE);
-               return null;
+            LibC.waitpid(pid, exit, 0);
+            exitCode.set(exit.getValue());
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void wantWrite() {
+        int fd = stdin.get();
+        if (fd != -1) {
+            userWantsWrite.set(true);
+            myProcessor.queueWrite(this);
+        } else {
+            throw new IllegalStateException("closeStdin() method has already been called.");
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void closeStdin() {
+        int fd = stdin.getAndSet(-1);
+        if (fd != -1) {
+            if (myProcessor != null) {
+                myProcessor.closeStdin(this);
             }
-         }
+            LibC.close(fd);
+        }
+    }
 
-         checkReturnCode(rc, "Invocation of posix_spawn() failed");
+    /** {@inheritDoc} */
+    @Override
+    public void writeStdin(ByteBuffer buffer) {
+        int fd = stdin.get();
+        if (fd != -1) {
+            pendingWrites.add(buffer);
+            myProcessor.queueWrite(this);
+        } else {
+            throw new IllegalStateException("closeStdin() method has already been called.");
+        }
+    }
 
-         afterStart();
+    /** {@inheritDoc} */
+    @Override
+    public boolean hasPendingWrites() {
+        return !pendingWrites.isEmpty();
+    }
 
-         registerProcess();
+    /** {@inheritDoc} */
+    @Override
+    public void setProcessHandler(NuProcessHandler processHandler) {
+        this.processHandler = processHandler;
+    }
 
-         callStart();
-
-         if (IS_MAC) {
-            // Signal the spawned process to continue (unsuspend)
-            LibC.kill(pid, LibC.SIGCONT);
-         }
-      }
-      catch (RuntimeException re) {
-         // TODO remove from event processor pid map?
-         re.printStackTrace(System.err);
-         onExit(Integer.MIN_VALUE);
-         return null;
-      }
-      finally {
-         LibC.posix_spawnattr_destroy(posix_spawnattr);
-         LibC.posix_spawn_file_actions_destroy(posix_spawn_file_actions);
-
-         // After we've spawned, close the unused ends of our pipes (that were dup'd into the child process space)
-         LibC.close(stdinWidow);
-         LibC.close(stdoutWidow);
-         LibC.close(stderrWidow);
-
-         if (IS_LINUX) {
-            Native.free(Pointer.nativeValue(posix_spawn_file_actions));
-            Native.free(Pointer.nativeValue(posix_spawnattr));
-         }
-      }
-
-      return this;
-   }
-
-   public int getPid()
-   {
-      return pid;
-   }
-
-   public AtomicInteger getStdin()
-   {
-      return stdin;
-   }
-
-   public AtomicInteger getStdout()
-   {
-      return stdout;
-   }
-
-   public AtomicInteger getStderr()
-   {
-      return stderr;
-   }
-
-   public boolean isSoftExit()
-   {
-      return (IS_SOFTEXIT_DETECTION && outClosed && errClosed);
-   }
-
-   public void onExit(int statusCode)
-   {
-      if (exitPending.getCount() == 0) {
-         // TODO: handle SIGCHLD
-         return;
-      }
-
-      try {
-         closeStdin();
-         close(stdout);
-         close(stderr);
-
-         exitCode.set(statusCode);
-         exitPending.countDown();
-         if (statusCode != Integer.MAX_VALUE - 1) {
-            processHandler.onExit(statusCode);
-         }
-      }
-      catch (Exception e) {
-         // Don't let an exception thrown from the user's handler interrupt us
-      }
-      finally {
-
-         Native.free(Pointer.nativeValue(outBufferPointer));
-         Native.free(Pointer.nativeValue(inBufferPointer));
-
-         processHandler = null;
-      }
-   }
-
-   public void readStdout(int availability)
-   {
-      if (outClosed || availability == 0) {
-         return;
-      }
-
-      try {
-         if (availability < 0) {
-            outClosed = true;
-            processHandler.onStdout(null);
-            return;
-         }
-         else if (availability == 0) {
-            return;
-         }
-
-         int read = LibC.read(stdout.get(), outBufferPointer, Math.min(availability, BUFFER_CAPACITY));
-         if (read == -1) {
-            outClosed = true;
-            throw new RuntimeException("Unexpected eof");
-            // EOF?
-         }
-
-         outBuffer.position(0);
-         outBuffer.limit(read);
-         processHandler.onStdout(outBuffer);
-      }
-      catch (Exception e) {
-         // Don't let an exception thrown from the user's handler interrupt us
-         e.printStackTrace(System.err);
-      }
-   }
-
-   public void readStderr(int availability)
-   {
-      if (errClosed || availability == 0) {
-         return;
-      }
-
-      try {
-         if (availability < 0) {
-            errClosed = true;
-            processHandler.onStderr(null);
-            return;
-         }
-
-         int read = LibC.read(stderr.get(), outBufferPointer, Math.min(availability, BUFFER_CAPACITY));
-         if (read == -1) {
-            // EOF?
-            errClosed = true;
-            throw new RuntimeException("Unexpected eof");
-         }
-
-         outBuffer.position(0);
-         outBuffer.limit(read);
-         processHandler.onStderr(outBuffer);
-      }
-      catch (Exception e) {
-         // Don't let an exception thrown from the user's handler interrupt us
-         e.printStackTrace(System.err);
-      }
-   }
-
-   public boolean writeStdin(int availability)
-   {
-      int fd = stdin.get();
-      if (availability <= 0 || fd == -1) {
-         return false;
-      }
-
-      if (remainingWrite > 0) {
-         int wrote = 0;
-         do {
-            wrote = LibC.write(fd, inBufferPointer.share(writeOffset), Math.min(remainingWrite, availability));
-            if (wrote < 0) {
-               int errno = Native.getLastError();
-               if (errno == 11 /*EAGAIN on MacOS*/|| errno == 35 /*EAGAIN on Linux*/) {
-                  availability /= 4;
-                  continue;
-               }
-
-               // EOF?
-               close(stdin);
-               return false;
+    // ************************************************************************
+    //                             Public methods
+    // ************************************************************************
+    public NuProcess start(List<String> command, String[] environment) {
+        callPreStart();
+        String[] commands = command.toArray(new String[0]);
+        Pointer posix_spawn_file_actions = createPipes();
+        Pointer posix_spawnattr = null;
+        if (IS_LINUX) {
+            long peer = Native.malloc(340);
+            posix_spawnattr = new Pointer(peer);
+        } else {
+            posix_spawnattr = new Memory(Pointer.SIZE);
+        }
+        try {
+            int rc = LibC.posix_spawnattr_init(posix_spawnattr);
+            checkReturnCode(rc, "Internal call to posix_spawnattr_init() failed");
+            short flags = 0;
+            if (IS_LINUX && LINUX_USE_VFORK) {
+                // POSIX_SPAWN_USEVFORK
+                flags = 0x40;
+            } else if (IS_MAC) {
+                // Start the spawned process in suspended mode
+                flags = LibC.POSIX_SPAWN_START_SUSPENDED | LibC.POSIX_SPAWN_CLOEXEC_DEFAULT;
             }
-         }
-         while (wrote < 0);
+            LibC.posix_spawnattr_setflags(posix_spawnattr, flags);
+            IntByReference restrict_pid = new IntByReference();
+            rc = LibC.posix_spawnp(restrict_pid, commands[0], posix_spawn_file_actions, posix_spawnattr, new StringArray(commands), new StringArray(environment));
+            pid = restrict_pid.getValue();
+            // any zombies due to launch failure
+            if (IS_LINUX) {
+                IntByReference exit = new IntByReference();
+                LibC.waitpid(pid, exit, LibC.WNOHANG);
+                rc = (exit.getValue() & 0xff00) >> 8;
+                if (rc == 127) {
+                    onExit(Integer.MIN_VALUE);
+                    return null;
+                }
+            }
+            checkReturnCode(rc, "Invocation of posix_spawn() failed");
+            afterStart();
+            registerProcess();
+            callStart();
+            if (IS_MAC) {
+                // Signal the spawned process to continue (unsuspend)
+                LibC.kill(pid, LibC.SIGCONT);
+            }
+        } catch (RuntimeException re) {
+            re.printStackTrace(System.err);
+            onExit(Integer.MIN_VALUE);
+            return null;
+        } finally {
+            LibC.posix_spawnattr_destroy(posix_spawnattr);
+            LibC.posix_spawn_file_actions_destroy(posix_spawn_file_actions);
+            // After we've spawned, close the unused ends of our pipes (that were dup'd into the child process space)
+            LibC.close(stdinWidow);
+            LibC.close(stdoutWidow);
+            LibC.close(stderrWidow);
+            if (IS_LINUX) {
+                Native.free(Pointer.nativeValue(posix_spawn_file_actions));
+                Native.free(Pointer.nativeValue(posix_spawnattr));
+            }
+        }
+        return this;
+    }
 
-         remainingWrite -= wrote;
-         writeOffset += wrote;
-         if (remainingWrite > 0) {
+    public int getPid() {
+        return pid;
+    }
+
+    public AtomicInteger getStdin() {
+        return stdin;
+    }
+
+    public AtomicInteger getStdout() {
+        return stdout;
+    }
+
+    public AtomicInteger getStderr() {
+        return stderr;
+    }
+
+    public boolean isSoftExit() {
+        return (IS_SOFTEXIT_DETECTION && outClosed && errClosed);
+    }
+
+    public void onExit(int statusCode) {
+        if (exitPending.getCount() == 0) {
+            // TODO: handle SIGCHLD
+            return;
+        }
+        try {
+            closeStdin();
+            close(stdout);
+            close(stderr);
+            exitCode.set(statusCode);
+            exitPending.countDown();
+            if (statusCode != Integer.MAX_VALUE - 1) {
+                processHandler.onExit(statusCode);
+            }
+        } catch (Exception e) {
+        } finally {
+            Native.free(Pointer.nativeValue(outBufferPointer));
+            Native.free(Pointer.nativeValue(inBufferPointer));
+            processHandler = null;
+        }
+    }
+
+    public void readStdout(int availability) {
+        if (outClosed || availability == 0) {
+            return;
+        }
+        try {
+            if (availability < 0) {
+                outClosed = true;
+                processHandler.onStdout(null);
+                return;
+            } else if (availability == 0) {
+                return;
+            }
+            int read = LibC.read(stdout.get(), outBufferPointer, Math.min(availability, BUFFER_CAPACITY));
+            if (read == -1) {
+                outClosed = true;
+                throw new RuntimeException("Unexpected eof");
+            // EOF?
+            }
+            outBuffer.position(0);
+            outBuffer.limit(read);
+            processHandler.onStdout(outBuffer);
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+        }
+    }
+
+    public void readStderr(int availability) {
+        if (errClosed || availability == 0) {
+            return;
+        }
+        try {
+            if (availability < 0) {
+                errClosed = true;
+                processHandler.onStderr(null);
+                return;
+            }
+            int read = LibC.read(stderr.get(), outBufferPointer, Math.min(availability, BUFFER_CAPACITY));
+            if (read == -1) {
+                // EOF?
+                errClosed = true;
+                throw new RuntimeException("Unexpected eof");
+            }
+            outBuffer.position(0);
+            outBuffer.limit(read);
+            processHandler.onStderr(outBuffer);
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+        }
+    }
+
+    public boolean writeStdin(int availability) {
+        int fd = stdin.get();
+        if (availability <= 0 || fd == -1) {
+            return false;
+        }
+        if (remainingWrite > 0) {
+            int wrote = 0;
+            do {
+                wrote = LibC.write(fd, inBufferPointer.share(writeOffset), Math.min(remainingWrite, availability));
+                if (wrote < 0) {
+                    int errno = Native.getLastError();
+                    if (errno == 11 || /*EAGAIN on MacOS*/
+                    errno == 35) /*EAGAIN on Linux*/
+                    {
+                        availability /= 4;
+                        continue;
+                    }
+                    // EOF?
+                    close(stdin);
+                    return false;
+                }
+            } while (wrote < 0);
+            remainingWrite -= wrote;
+            writeOffset += wrote;
+            if (remainingWrite > 0) {
+                return true;
+            }
+            inBuffer.clear();
+            remainingWrite = 0;
+            writeOffset = 0;
+        }
+        if (!pendingWrites.isEmpty()) {
+            // copy the next buffer into our direct buffer (inBuffer)
+            ByteBuffer byteBuffer = pendingWrites.peek();
+            if (byteBuffer.remaining() > BUFFER_CAPACITY) {
+                ByteBuffer slice = byteBuffer.slice();
+                slice.limit(BUFFER_CAPACITY);
+                inBuffer.put(slice);
+                byteBuffer.position(byteBuffer.position() + BUFFER_CAPACITY);
+                remainingWrite = BUFFER_CAPACITY;
+            } else {
+                remainingWrite = byteBuffer.remaining();
+                inBuffer.put(byteBuffer);
+                pendingWrites.poll();
+            }
+            // Recurse
+            if (remainingWrite > 0) {
+                return writeStdin(availability);
+            }
+        }
+        if (!userWantsWrite.get()) {
+            return false;
+        }
+        try {
+            inBuffer.clear();
+            boolean wantMore = processHandler.onStdinReady(inBuffer);
+            userWantsWrite.set(wantMore);
+            remainingWrite = inBuffer.remaining();
             return true;
-         }
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
-         inBuffer.clear();
-         remainingWrite = 0;
-         writeOffset = 0;
-      }
+    // ************************************************************************
+    //                             Private methods
+    // ************************************************************************
+    private void afterStart() {
+        outClosed = false;
+        errClosed = false;
+        pendingWrites = new ConcurrentLinkedQueue<ByteBuffer>();
+        long peer = Native.malloc(BUFFER_CAPACITY);
+        outBuffer = UnsafeHelper.wrapNativeMemory(peer, BUFFER_CAPACITY);
+        outBufferPointer = new Pointer(peer);
+        peer = Native.malloc(BUFFER_CAPACITY);
+        inBuffer = UnsafeHelper.wrapNativeMemory(peer, BUFFER_CAPACITY);
+        inBufferPointer = new Pointer(peer);
+    }
 
-      if (!pendingWrites.isEmpty()) {
-         // copy the next buffer into our direct buffer (inBuffer)
-         ByteBuffer byteBuffer = pendingWrites.peek();
-         if (byteBuffer.remaining() > BUFFER_CAPACITY) {
-            ByteBuffer slice = byteBuffer.slice();
-            slice.limit(BUFFER_CAPACITY);
-            inBuffer.put(slice);
-            byteBuffer.position(byteBuffer.position() + BUFFER_CAPACITY);
-            remainingWrite = BUFFER_CAPACITY;
-         }
-         else {
-            remainingWrite = byteBuffer.remaining();
-            inBuffer.put(byteBuffer);
-            pendingWrites.poll();
-         }
+    @SuppressWarnings("unchecked")
+    private void registerProcess() {
+        int mySlot = 0;
+        synchronized (processors) {
+            mySlot = processorRoundRobin;
+            processorRoundRobin = (processorRoundRobin + 1) % processors.length;
+        }
+        myProcessor = (IEventProcessor<? super BasePosixProcess>) processors[mySlot];
+        myProcessor.registerProcess(this);
+        if (myProcessor.checkAndSetRunning()) {
+            CyclicBarrier spawnBarrier = myProcessor.getSpawnBarrier();
+            Thread t = new Thread(myProcessor, (IS_LINUX ? "ProcessEpoll" : "ProcessKqueue") + mySlot);
+            t.setDaemon(true);
+            t.start();
+            try {
+                spawnBarrier.await();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
 
-         // Recurse
-         if (remainingWrite > 0) {
-            return writeStdin(availability);
-         }
-      }
+    private void callPreStart() {
+        try {
+            processHandler.onPreStart(this);
+        } catch (Exception e) {
+        }
+    }
 
-      if (!userWantsWrite.get()) {
-         return false;
-      }
+    private void callStart() {
+        try {
+            processHandler.onStart(this);
+        } catch (Exception e) {
+        }
+    }
 
-      try {
-         inBuffer.clear();
-         boolean wantMore = processHandler.onStdinReady(inBuffer);
-         userWantsWrite.set(wantMore);
-         remainingWrite = inBuffer.remaining();
+    private void close(AtomicInteger stdX) {
+        int fd = stdX.getAndSet(-1);
+        if (fd != -1) {
+            LibC.close(fd);
+        }
+    }
 
-         return true;
-      }
-      catch (Exception e) {
-         // Don't let an exception thrown from the user's handler interrupt us
-         return false;
-      }
-   }
+    private Pointer createPipes() {
+        int rc = 0;
+        int[] in = new int[2];
+        int[] out = new int[2];
+        int[] err = new int[2];
+        posix_spawn_file_actions = null;
+        if (IS_LINUX) {
+            long peer = Native.malloc(80);
+            posix_spawn_file_actions = new Pointer(peer);
+        } else {
+            posix_spawn_file_actions = new Memory(Pointer.SIZE);
+        }
+        try {
+            rc = LibC.pipe(in);
+            checkReturnCode(rc, "Create stdin pipe() failed");
+            rc = LibC.pipe(out);
+            checkReturnCode(rc, "Create stdout pipe() failed");
+            rc = LibC.pipe(err);
+            checkReturnCode(rc, "Create stderr pipe() failed");
+            // Create spawn file actions
+            rc = LibC.posix_spawn_file_actions_init(posix_spawn_file_actions);
+            checkReturnCode(rc, "Internal call to posix_spawn_file_actions_init() failed");
+            // Dup the reading end of the pipe into the sub-process, and close our end
+            rc = LibC.posix_spawn_file_actions_adddup2(posix_spawn_file_actions, in[0], 0);
+            checkReturnCode(rc, "Internal call to posix_spawn_file_actions_adddup2() failed");
+            rc = LibC.posix_spawn_file_actions_addclose(posix_spawn_file_actions, in[1]);
+            checkReturnCode(rc, "Internal call to posix_spawn_file_actions_addclose() failed");
+            stdin.set(in[1]);
+            stdinWidow = in[0];
+            // Dup the writing end of the pipe into the sub-process, and close our end
+            rc = LibC.posix_spawn_file_actions_adddup2(posix_spawn_file_actions, out[1], 1);
+            checkReturnCode(rc, "Internal call to posix_spawn_file_actions_adddup2() failed");
+            rc = LibC.posix_spawn_file_actions_addclose(posix_spawn_file_actions, out[0]);
+            checkReturnCode(rc, "Internal call to posix_spawn_file_actions_addclose() failed");
+            stdout.set(out[0]);
+            stdoutWidow = out[1];
+            // Dup the writing end of the pipe into the sub-process, and close our end
+            rc = LibC.posix_spawn_file_actions_adddup2(posix_spawn_file_actions, err[1], 2);
+            checkReturnCode(rc, "Internal call to posix_spawn_file_actions_adddup2() failed");
+            rc = LibC.posix_spawn_file_actions_addclose(posix_spawn_file_actions, err[0]);
+            checkReturnCode(rc, "Internal call to posix_spawn_file_actions_addclose() failed");
+            stderr.set(err[0]);
+            stderrWidow = err[1];
+            if (IS_LINUX || IS_MAC) {
+                rc = LibC.fcntl(in[1], LibC.F_SETFL, LibC.fcntl(in[1], LibC.F_GETFL) | LibC.O_NONBLOCK);
+                checkReturnCode(rc, "fnctl on stdin handle failed");
+                rc = LibC.fcntl(out[0], LibC.F_SETFL, LibC.fcntl(out[0], LibC.F_GETFL) | LibC.O_NONBLOCK);
+                checkReturnCode(rc, "fnctl on stdout handle failed");
+                rc = LibC.fcntl(err[0], LibC.F_SETFL, LibC.fcntl(err[0], LibC.F_GETFL) | LibC.O_NONBLOCK);
+                checkReturnCode(rc, "fnctl on stderr handle failed");
+            }
+            return posix_spawn_file_actions;
+        } catch (RuntimeException e) {
+            e.printStackTrace(System.err);
+            LibC.posix_spawn_file_actions_destroy(posix_spawn_file_actions);
+            initFailureCleanup(in, out, err);
+            throw e;
+        }
+    }
 
-   // ************************************************************************
-   //                             Private methods
-   // ************************************************************************
+    private void initFailureCleanup(int[] in, int[] out, int[] err) {
+        Set<Integer> unique = new HashSet<Integer>();
+        if (in != null) {
+            unique.add(in[0]);
+            unique.add(in[1]);
+        }
+        if (out != null) {
+            unique.add(out[0]);
+            unique.add(out[1]);
+        }
+        if (err != null) {
+            unique.add(err[0]);
+            unique.add(err[1]);
+        }
+        for (int fildes : unique) {
+            if (fildes != 0) {
+                LibC.close(fildes);
+            }
+        }
+    }
 
-   private void afterStart()
-   {
-      outClosed = false;
-      errClosed = false;
-
-      pendingWrites = new ConcurrentLinkedQueue<ByteBuffer>();
-
-      long peer = Native.malloc(BUFFER_CAPACITY);
-      outBuffer = UnsafeHelper.wrapNativeMemory(peer, BUFFER_CAPACITY);
-      outBufferPointer = new Pointer(peer);
-
-      peer = Native.malloc(BUFFER_CAPACITY);
-      inBuffer = UnsafeHelper.wrapNativeMemory(peer, BUFFER_CAPACITY);
-      inBufferPointer = new Pointer(peer);
-   }
-
-   @SuppressWarnings("unchecked")
-   private void registerProcess()
-   {
-      int mySlot = 0;
-      synchronized (processors) {
-         mySlot = processorRoundRobin;
-         processorRoundRobin = (processorRoundRobin + 1) % processors.length;
-      }
-
-      myProcessor = (IEventProcessor<? super BasePosixProcess>) processors[mySlot];
-      myProcessor.registerProcess(this);
-
-      if (myProcessor.checkAndSetRunning()) {
-         CyclicBarrier spawnBarrier = myProcessor.getSpawnBarrier();
-
-         Thread t = new Thread(myProcessor, (IS_LINUX ? "ProcessEpoll" : "ProcessKqueue") + mySlot);
-         t.setDaemon(true);
-         t.start();
-
-         try {
-            spawnBarrier.await();
-         }
-         catch (Exception e) {
-            throw new RuntimeException(e);
-         }
-      }
-   }
-
-   private void callStart()
-   {
-      try {
-         processHandler.onStart(this);
-      }
-      catch (Exception e) {
-         // Don't let an exception thrown from the user's handler interrupt us
-      }
-   }
-
-   private void close(AtomicInteger stdX)
-   {
-      int fd = stdX.getAndSet(-1);
-      if (fd != -1) {
-         LibC.close(fd);
-      }
-   }
-
-   private Pointer createPipes()
-   {
-      int rc = 0;
-
-      int[] in = new int[2];
-      int[] out = new int[2];
-      int[] err = new int[2];
-
-      posix_spawn_file_actions = null;
-      if (IS_LINUX) {
-         long peer = Native.malloc(80);
-         posix_spawn_file_actions = new Pointer(peer);
-      }
-      else {
-         posix_spawn_file_actions = new Memory(Pointer.SIZE);
-      }
-
-      try {
-         rc = LibC.pipe(in);
-         checkReturnCode(rc, "Create stdin pipe() failed");
-         rc = LibC.pipe(out);
-         checkReturnCode(rc, "Create stdout pipe() failed");
-
-         rc = LibC.pipe(err);
-         checkReturnCode(rc, "Create stderr pipe() failed");
-
-         // Create spawn file actions
-         rc = LibC.posix_spawn_file_actions_init(posix_spawn_file_actions);
-         checkReturnCode(rc, "Internal call to posix_spawn_file_actions_init() failed");
-
-         // Dup the reading end of the pipe into the sub-process, and close our end
-         rc = LibC.posix_spawn_file_actions_adddup2(posix_spawn_file_actions, in[0], 0);
-         checkReturnCode(rc, "Internal call to posix_spawn_file_actions_adddup2() failed");
-
-         rc = LibC.posix_spawn_file_actions_addclose(posix_spawn_file_actions, in[1]);
-         checkReturnCode(rc, "Internal call to posix_spawn_file_actions_addclose() failed");
-
-         stdin.set(in[1]);
-         stdinWidow = in[0];
-
-         // Dup the writing end of the pipe into the sub-process, and close our end
-         rc = LibC.posix_spawn_file_actions_adddup2(posix_spawn_file_actions, out[1], 1);
-         checkReturnCode(rc, "Internal call to posix_spawn_file_actions_adddup2() failed");
-
-         rc = LibC.posix_spawn_file_actions_addclose(posix_spawn_file_actions, out[0]);
-         checkReturnCode(rc, "Internal call to posix_spawn_file_actions_addclose() failed");
-
-         stdout.set(out[0]);
-         stdoutWidow = out[1];
-
-         // Dup the writing end of the pipe into the sub-process, and close our end
-         rc = LibC.posix_spawn_file_actions_adddup2(posix_spawn_file_actions, err[1], 2);
-         checkReturnCode(rc, "Internal call to posix_spawn_file_actions_adddup2() failed");
-
-         rc = LibC.posix_spawn_file_actions_addclose(posix_spawn_file_actions, err[0]);
-         checkReturnCode(rc, "Internal call to posix_spawn_file_actions_addclose() failed");
-
-         stderr.set(err[0]);
-         stderrWidow = err[1];
-
-         if (IS_LINUX || IS_MAC) {
-            rc = LibC.fcntl(in[1], LibC.F_SETFL, LibC.fcntl(in[1], LibC.F_GETFL) | LibC.O_NONBLOCK);
-            checkReturnCode(rc, "fnctl on stdin handle failed");
-            rc = LibC.fcntl(out[0], LibC.F_SETFL, LibC.fcntl(out[0], LibC.F_GETFL) | LibC.O_NONBLOCK);
-            checkReturnCode(rc, "fnctl on stdout handle failed");
-            rc = LibC.fcntl(err[0], LibC.F_SETFL, LibC.fcntl(err[0], LibC.F_GETFL) | LibC.O_NONBLOCK);
-            checkReturnCode(rc, "fnctl on stderr handle failed");
-         }
-
-         return posix_spawn_file_actions;
-      }
-      catch (RuntimeException e) {
-         e.printStackTrace(System.err);
-
-         LibC.posix_spawn_file_actions_destroy(posix_spawn_file_actions);
-         initFailureCleanup(in, out, err);
-         throw e;
-      }
-   }
-
-   private void initFailureCleanup(int[] in, int[] out, int[] err)
-   {
-      Set<Integer> unique = new HashSet<Integer>();
-      if (in != null) {
-         unique.add(in[0]);
-         unique.add(in[1]);
-      }
-
-      if (out != null) {
-         unique.add(out[0]);
-         unique.add(out[1]);
-      }
-
-      if (err != null) {
-         unique.add(err[0]);
-         unique.add(err[1]);
-      }
-
-      for (int fildes : unique) {
-         if (fildes != 0) {
-            LibC.close(fildes);
-         }
-      }
-   }
-
-   private void checkReturnCode(int rc, String failureMessage)
-   {
-      if (rc != 0) {
-         throw new RuntimeException(failureMessage + ", return code: " + rc + ", last error: " + Native.getLastError());
-      }
-   }
+    private void checkReturnCode(int rc, String failureMessage) {
+        if (rc != 0) {
+            throw new RuntimeException(failureMessage + ", return code: " + rc + ", last error: " + Native.getLastError());
+        }
+    }
 }
